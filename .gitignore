@@ -1,0 +1,4 @@
+*.snz
+snappy_decompress
+__pycache__
+*part-
