@@ -9,34 +9,29 @@ License: MIT
 """
 
 import boto3
-
-import snappy
-import FileFormatDetection
 from boto3 import session
+from botocore import UNSIGNED
+from botocore.client import Config
+from botocore.exceptions import NoCredentialsError
 
 import os
 import io
 import threading
 import time
 
-from botocore import UNSIGNED
-from botocore.client import Config
-from botocore.exceptions import NoCredentialsError
-
+import snappy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import FileFormatDetection
 
 import TripEvent
 import AdaptTimeOption
-from Event import Event 
 
-import logging
-import Event
-import TripEvent
-from AdaptTimeOption import AdaptTimeOption
 REGION = "us-east-1"
 BUCKET_NAME = "aws-bigdata-blog"
 OBJECT_PREFIX = "artifacts/flink-refarch/data/nyc-tlc-trips.snz/"
-MAX_FILES = 3  # max files to process
+MAX_FILES = 20  # max files to download
 OUTPUT_DIR = "./snappy_decompressed_events"
+MAX_WORKERS = 20  # threads for parallel downloads
 
 # ----------------------
 # Globals for simple stats
@@ -46,6 +41,12 @@ total_events = 0
 total_processing_time = 0.0
 earliest_time = None
 latest_time = None
+
+session_ = session.Session()
+s3_resource = session_.resource('s3', region_name=REGION)
+
+bucket = s3_resource.Bucket(BUCKET_NAME)
+print("Files in S3 bucket:")
 
 # ----------------------
 # Helpers
@@ -65,7 +66,6 @@ def list_s3_objects(bucket_name: str, prefix: str, max_files: int):
     bucket = s3_res.Bucket(bucket_name)
     out = []
     for i, obj in enumerate(bucket.objects.filter(Prefix=prefix)):
-        #logger.info(f"Found: {obj.key}")
         print(f"Found: {obj.key}")
         out.append(obj)
         if i + 1 >= max_files:
@@ -93,13 +93,15 @@ def process_object(obj_summary, s3_client):
     - write all raw lines to a dedicated output file
     - update global stats
     """
+    print(f"Thread Name: {threading.current_thread().name} - Starting processing for {obj_summary.key}")
+
     global total_events, total_processing_time, earliest_time, latest_time
 
     key = obj_summary.key
     stream, read_time, size = download_and_decompress(s3_client, obj_summary)
     bps = (size / read_time) if read_time > 0 else float("inf")
-    #logger.info(f"Read {key}: {size} bytes in {read_time:.2f}s ({bps:.2f} B/s)")
-    print(f"Read {key}: {size} bytes in {read_time:.2f}s ({bps:.2f} B/s)")  
+    print(f"Read {key}: {size} bytes in {read_time:.2f}s ({bps:.2f} B/s)")
+
     # Prepare per-object output file
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, safe_filename_from_key(key, ".ndjson"))
@@ -131,10 +133,8 @@ def process_object(obj_summary, s3_client):
                 if events % 50000 == 0:
                     fh.flush()
             except ValueError:
-                #logger.warning(f"{key}: Ignoring malformed line.")
                 print(f"{key}: Ignoring malformed line.")
             except Exception as e:
-                #logger.error(f"{key}: Error processing line: {e}")
                 print(f"{key}: Error processing line: {e}")
 
     proc_time = max(0.0, time.time() - start_proc)
@@ -143,26 +143,54 @@ def process_object(obj_summary, s3_client):
         total_processing_time += proc_time
 
     thr = (events / proc_time) if proc_time > 0 else 0.0
-    #logger.info(f"Wrote {events} events to {out_path} | ProcTime {proc_time:.2f}s | {thr:.2f} ev/s")
-    print(f"Wrote {events} events to {out_path} | ProcTime {proc_time:.2f}s | {thr:.2f} ev/s")  
-    return out_path, events, proc_time
+    print(f"Wrote {events} events to {out_path} | ProcTime {proc_time:.2f}s | {thr:.2f} ev/s")
+    return out_path, events, proc_time, threading.current_thread().name
 
-session_ = session.Session()
-s3_resource = session_.resource('s3', region_name=REGION)
+def main():
+    # S3 client (signed but reading public OK)
+    sess = session.Session()
+    s3_client = sess.client("s3", region_name=REGION)
 
-bucket = s3_resource.Bucket(BUCKET_NAME)
-print("Files in S3 bucket:")
+    objs = list_s3_objects(BUCKET_NAME, OBJECT_PREFIX, MAX_FILES)
+    if not objs:
+        print("No S3 objects found for given prefix.")
+        return
 
-for obj in bucket.objects.filter(Prefix=OBJECT_PREFIX):
-    target = obj.key.split("/")[-1]
-    if target:  # avoid downloading empty prefix
-        print(f"Downloading {obj.key} to {target}")
-        bucket.download_file(obj.key, "./"+target)
-        print(f"Downloaded {obj.key} to {target}")
-        res = FileFormatDetection.sniff_format("./"+target)
-        print(f'File Format detection summary for {target} is {res.summary()}')
-        print(f'File Format detection isColumar for {target} is {res.is_columnar()}')
-        print(f'File Format detection isCompressed for {target} is {res.is_compressed()}')
-        print(f'File Format detection metadata for {target} is {res.metadata()}')
-        print(target)
-        print(f"Size: {obj.size/(1024*1024)} MB")
+    t0 = time.time()
+    outputs = []
+
+    # Get the current thread object
+    current_thread = threading.current_thread()
+    print(f"Thread Name: {current_thread.name}")
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(process_object, obj, s3_client): obj.key for obj in objs}
+        for fut in as_completed(futures):
+            key = futures[fut]
+            try:
+                out_path, events, proc_time, threadname = fut.result()
+                print(f"Thread Name: {threadname} | Completed processing {key}: {events} events in {proc_time:.2f}s")
+                outputs.append(out_path)
+            except Exception as e:
+                print(f"Failed processing {key}: {e}")
+
+    print(f"Thread Name: {current_thread.name}")
+
+    total_time = max(0.0, time.time() - t0)
+
+    # Final stats (raw millis)
+    if total_events > 0:
+        overall_thr = (total_events / total_processing_time) if total_processing_time > 0 else 0.0
+        print(f"----- SUMMARY -----")
+        print(f"Objects processed: {len(outputs)}")
+        print(f"Total events: {total_events}")
+        print(f"Overall processing throughput: {overall_thr:.2f} ev/s")
+        if earliest_time is not None:
+            print(f"Earliest Event Time (ms since epoch): {earliest_time}")
+        if latest_time is not None:
+            print(f"Latest Event Time (ms since epoch): {latest_time}")
+        print(f"Output directory: {os.path.abspath(OUTPUT_DIR)}")
+        print(f"Total wall time: {total_time:.2f}s")
+
+if __name__ == "__main__":
+    main()
