@@ -26,7 +26,7 @@ import FileFormatDetection
 import TripEvent
 import AdaptTimeOption
 
-REGION = "us-east-1"
+REGION = "us-east-2"
 BUCKET_NAME = "aws-bigdata-blog"
 OBJECT_PREFIX = "artifacts/flink-refarch/data/nyc-tlc-trips.snz/"
 MAX_FILES = 20  # max files to download
@@ -101,6 +101,10 @@ def process_object(obj_summary, s3_client):
     stream, read_time, size = download_and_decompress(s3_client, obj_summary)
     bps = (size / read_time) if read_time > 0 else float("inf")
     print(f"Read {key}: {size} bytes in {read_time:.2f}s ({bps:.2f} B/s)")
+
+    file_format = FileFormatDetection.detect_file_format(stream)
+    print(f"Detected file format for {key}: {file_format}")
+    stream.seek(0) # rewind after detection
 
     # Prepare per-object output file
     os.makedirs(OUTPUT_DIR, exist_ok=True)
