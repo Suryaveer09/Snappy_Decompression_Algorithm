@@ -5,8 +5,8 @@ from Event import Event
 
 
 class TripEvent(Event):
-    def _init_(self, payload):
-        super()._init_(payload)
+    def __init__(self, payload):
+        super().__init__(payload)
         json_data = json.loads(self.payload)
         self.trip_id = json_data["trip_id"]
         #self.timestamp = datetime.fromisoformat(json_data["dropoff_datetime"]).timestamp() * 1000
@@ -50,8 +50,8 @@ class TripEvent(Event):
     def get_partition_key(self):
         return str(self.trip_id)
     
-    def _lt_(self, other):
+    def __lt__(self, other):
         return self.trip_id < other.trip_id
     
-    def _hash_(self):
+    def __hash__(self):
         return hash(self.payload)

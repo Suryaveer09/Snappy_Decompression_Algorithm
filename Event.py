@@ -1,17 +1,17 @@
 import hashlib
 
 class Event:
-    def _init_(self, payload):
+    def __init__(self, payload):
         if not payload.endswith("\n"):
             # Append a newline to the output to make it easier to process by other tools
             self.payload = payload + "\n"
         else:
             self.payload = payload
 
-    def _hash_(self):
+    def __hash__(self):
         return hashlib.sha256(self.payload.encode()).hexdigest()
 
-    def _str_(self):
+    def __str__(self):
         return self.payload
 
     def to_byte_buffer(self):
