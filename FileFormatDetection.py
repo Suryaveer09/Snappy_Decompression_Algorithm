@@ -1,19 +1,31 @@
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, BinaryIO
+from typing import Dict, Any, Tuple, BinaryIO, Optional
 from io import BytesIO
+import os
 
+_version_ = "0.1.0"
+_author_ = "Your Name"  # Replace with your name or organization
+_license_ = "MIT"  # Or whichever license you prefer
 
 # -------------------------------------------------------------------------
 # Class: FileFormatDetection
 # -------------------------------------------------------------------------
 @dataclass
 class FileFormatDetection:
-    format: str                 # e.g., "gzip", "parquet", "orc", "unknown"
-    confidence: float           # 0.0..1.0
-    evidence: str               # why it was classified
+    """
+    Represents the result of file format detection.
+    
+    Attributes:
+        format: The detected format (e.g., "gzip", "parquet", "unknown").
+        confidence: A float between 0.0 and 1.0 indicating detection confidence.
+        evidence: A string explaining why the format was classified as such.
+        extra: Optional dictionary for additional metadata.
+    """
+    format: str
+    confidence: float
+    evidence: str
     extra: Dict[str, Any] = field(default_factory=dict)
 
-    # ---------- Introspection Helpers ----------
     def is_known(self) -> bool:
         """Return True if the format is identified with nonzero confidence."""
         return self.format.lower() != "unknown" and self.confidence > 0.0
@@ -89,6 +101,13 @@ SIGNATURES = {
         "start": [b"\xff\x06\x00\x00sNaPpY"],
         "evidence": "Starts with ff 06 00 00 'sNaPpY' (Snappy framed).",
     },
+    "brotli": {
+        # Brotli doesn't have a fixed magic number, but we can check for common patterns.
+        # This is a heuristic: first byte often 0x91-0x9F for compressed data.
+        "heuristic": lambda head: head and 0x91 <= head[0] <= 0x9F,
+        "evidence": "First byte in range 0x91-0x9F (Brotli heuristic).",
+        "confidence": 0.5,  # Lower confidence since it's heuristic
+    },
     "parquet": {
         "start": [b"PAR1"],
         "end": [b"PAR1"],
@@ -108,27 +127,44 @@ SIGNATURES = {
 # -------------------------------------------------------------------------
 # Helpers for signature sniffing
 # -------------------------------------------------------------------------
-def _read_ranges(fp: BinaryIO, head_n=64, tail_n=64,
-                 tar_probe_offset=257, tar_probe_len=8) -> Tuple[bytes, bytes, bytes]:
+def _read_ranges(fp: BinaryIO, head_n: int = 64, tail_n: int = 64,
+                 tar_probe_offset: int = 257, tar_probe_len: int = 8) -> Tuple[bytes, bytes, bytes]:
     """
-    Read head, tail, and a slice around TAR's magic position.
-    Works for files and file-like objects supporting seek().
+    Read head, tail, and a slice around TAR's magic position from a seekable stream.
+    
+    Args:
+        fp: A seekable binary file-like object.
+        head_n: Number of bytes to read from the start.
+        tail_n: Number of bytes to read from the end.
+        tar_probe_offset: Offset for TAR magic check.
+        tar_probe_len: Length of TAR magic slice.
+    
+    Returns:
+        Tuple of (head bytes, tail bytes, tar_slice bytes).
+    
+    Raises:
+        ValueError: If the stream is not seekable.
     """
-    # head
-    fp.seek(0, 0)
+    if not (hasattr(fp, "seekable") and fp.seekable()):
+        raise ValueError("Stream must be seekable for _read_ranges.")
+
+    # Get file size
+    fp.seek(0, os.SEEK_END)
+    size = fp.tell()
+    fp.seek(0, os.SEEK_SET)
+
+    # Read head
     head = fp.read(head_n)
 
-    # tail
-    fp.seek(0, 2)
-    size = fp.tell()
+    # Read tail
     tail_len = min(tail_n, size)
-    fp.seek(size - tail_len, 0)
+    fp.seek(max(0, size - tail_len), os.SEEK_SET)
     tail = fp.read(tail_len)
 
-    # tar magic at offset 257
+    # Read TAR slice
     tar_slice = b""
     if size >= tar_probe_offset + tar_probe_len:
-        fp.seek(tar_probe_offset, 0)
+        fp.seek(tar_probe_offset, os.SEEK_SET)
         tar_slice = fp.read(tar_probe_len)
 
     return head, tail, tar_slice
@@ -136,88 +172,135 @@ def _read_ranges(fp: BinaryIO, head_n=64, tail_n=64,
 
 def _detect_from_ranges(head: bytes, tail: bytes, tar_slice: bytes) -> FileFormatDetection:
     """Apply signature checks to the extracted byte ranges."""
-    def starts_with_any(buf: bytes, patterns) -> bool:
-        return any(buf.startswith(p) for p in patterns)
+    def starts_with_any(buf: bytes, patterns: list) -> bool:
+        return any(buf.startswith(p) for p in patterns if p)
 
-    def ends_with_any(buf: bytes, patterns) -> bool:
-        return any(buf.endswith(p) for p in patterns)
+    def ends_with_any(buf: bytes, patterns: list) -> bool:
+        return any(buf.endswith(p) for p in patterns if p)
 
-    # 1) Parquet
-    s = SIGNATURES["parquet"]
-    if starts_with_any(head, s["start"]) and ends_with_any(tail, s["end"]):
-        return FileFormatDetection("parquet", 1.0, s["evidence"], {})
+    def contains_any(buf: bytes, patterns: list) -> bool:
+        return any(p in buf for p in patterns if p)
 
-    # 2) Start-only signatures
-    for name in ["gzip", "zstd", "bzip2", "lz4-frame", "xz", "zip", "7z", "snappy-framed"]:
-        s = SIGNATURES[name]
-        if starts_with_any(head, s["start"]):
-            return FileFormatDetection(name, 1.0, s["evidence"], {})
+    # Check in priority order (more specific first)
+    for fmt, sig in SIGNATURES.items():
+        confidence = sig.get("confidence", 1.0)
 
-    # 3) TAR (magic at offset 257)
-    s = SIGNATURES["tar"]
-    if any(tar_slice.startswith(p) for p in s["tar_magic"]):
-        return FileFormatDetection("tar", 0.95, s["evidence"], {})
+        if "heuristic" in sig:
+            if sig["heuristic"](head):
+                return FileFormatDetection(fmt, confidence, sig["evidence"], {})
+            continue
 
-    # 4) ORC (postscript marker near tail)
-    s = SIGNATURES["orc"]
-    if any(p in tail[-16:] for p in s["end_contains"]):
-        return FileFormatDetection("orc", 0.9, s["evidence"], {})
+        match = True
 
-    # 5) Unknown
+        if "start" in sig and not starts_with_any(head, sig["start"]):
+            match = False
+        if "end" in sig and not ends_with_any(tail, sig["end"]):
+            match = False
+        if "end_contains" in sig and not contains_any(tail, sig["end_contains"]):
+            match = False
+        if "tar_magic" in sig and not starts_with_any(tar_slice, sig["tar_magic"]):
+            match = False
+
+        if match:
+            return FileFormatDetection(fmt, confidence, sig["evidence"], {})
+
+    # Unknown
     return FileFormatDetection("unknown", 0.0, "No decisive signature found.", {})
 
 
 # -------------------------------------------------------------------------
 # Main Function: sniff_format (filepath-based)
 # -------------------------------------------------------------------------
-def sniff_format(file_path: str) -> FileFormatDetection:
+def sniff_format(file_path: str, head_n: int = 64, tail_n: int = 64) -> FileFormatDetection:
     """
-    Identify common compression/archival/columnar formats by signatures.
-    Returns a FileFormatDetection object.
+    Identify common compression/archival/columnar formats by signatures from a file path.
+    
+    Args:
+        file_path: Path to the file.
+        head_n: Bytes to read from the start (default: 64).
+        tail_n: Bytes to read from the end (default: 64).
+    
+    Returns:
+        FileFormatDetection object.
     """
+    if not os.path.exists(file_path):
+        return FileFormatDetection("unknown", 0.0, "File not found.", {})
+    
     try:
         with open(file_path, "rb") as fp:
-            head, tail, tar_slice = _read_ranges(fp)
-    except FileNotFoundError:
-        return FileFormatDetection("unknown", 0.0, "File not found.", {})
+            head, tail, tar_slice = _read_ranges(fp, head_n, tail_n)
+            return _detect_from_ranges(head, tail, tar_slice)
     except Exception as e:
-        return FileFormatDetection("unknown", 0.0, f"I/O error: {e}", {})
-
-    return _detect_from_ranges(head, tail, tar_slice)
+        return FileFormatDetection("unknown", 0.0, f"I/O error: {str(e)}", {})
 
 
 # -------------------------------------------------------------------------
-# New Function: sniff_stream (file-like object)
+# Function: sniff_stream (file-like object)
 # -------------------------------------------------------------------------
-def sniff_stream(stream: BinaryIO) -> FileFormatDetection:
+def sniff_stream(stream: BinaryIO, head_n: int = 64, tail_n: int = 64,
+                 buffer_non_seekable: bool = True) -> FileFormatDetection:
     """
     Identify format from a file-like object.
-    - If the stream is seekable, read ranges in-place.
-    - If not seekable, buffer into a BytesIO and then sniff.
+    
+    - If seekable, reads ranges in-place without consuming the stream.
+    - If not seekable and buffer_non_seekable=True, buffers the entire stream into memory.
+    - If not seekable and buffer_non_seekable=False, attempts partial detection (head only).
+    
+    Args:
+        stream: Binary file-like object.
+        head_n: Bytes to read from the start.
+        tail_n: Bytes to read from the end.
+        buffer_non_seekable: Whether to buffer non-seekable streams (may consume memory).
+    
+    Returns:
+        FileFormatDetection object.
+    
+    Warning:
+        For large non-seekable streams, buffering may use significant memory.
     """
     try:
-        # Prefer in-place if seekable
         if hasattr(stream, "seekable") and stream.seekable():
+            original_pos = stream.tell()
             try:
-                pos = stream.tell()
-            except Exception:
-                pos = None
-
-            head, tail, tar_slice = _read_ranges(stream)
-
-            # restore original position best-effort
-            if pos is not None:
-                try:
-                    stream.seek(pos, 0)
-                except Exception:
-                    pass
+                head, tail, tar_slice = _read_ranges(stream, head_n, tail_n)
+                return _detect_from_ranges(head, tail, tar_slice)
+            finally:
+                stream.seek(original_pos, os.SEEK_SET)
         else:
-            # Non-seekable: buffer the content
+            if not buffer_non_seekable:
+                # Partial detection: only head-based formats
+                head = stream.read(head_n)
+                # Mock tail and tar_slice as empty (limits detection)
+                partial_detection = _detect_from_ranges(head, b"", b"")
+                if partial_detection.is_known():
+                    partial_detection.confidence *= 0.8  # Reduce confidence for partial
+                    partial_detection.evidence += " (partial detection from head only)."
+                return partial_detection
+            
+            # Buffer entire stream
             data = stream.read()
-            fp = BytesIO(data)
-            head, tail, tar_slice = _read_ranges(fp)
-
+            with BytesIO(data) as fp:
+                head, tail, tar_slice = _read_ranges(fp, head_n, tail_n)
+                return _detect_from_ranges(head, tail, tar_slice)
     except Exception as e:
-        return FileFormatDetection("unknown", 0.0, f"Stream read error: {e}", {})
+        return FileFormatDetection("unknown", 0.0, f"Stream read error: {str(e)}", {})
 
-    return _detect_from_ranges(head, tail, tar_slice)
+
+# -------------------------------------------------------------------------
+# Extension API: Add custom signature
+# -------------------------------------------------------------------------
+def add_signature(format_name: str, signature: Dict[str, Any], overwrite: bool = False) -> None:
+    """
+    Add or update a custom signature to the SIGNATURES table.
+    
+    Args:
+        format_name: Name of the format (e.g., "custom").
+        signature: Dictionary with keys like 'start', 'end', etc., matching SIGNATURES structure.
+        overwrite: If True, overwrite existing signature.
+    
+    Raises:
+        ValueError: If format_name exists and overwrite=False.
+    """
+    if format_name in SIGNATURES and not overwrite:
+        raise ValueError(f"Signature for '{format_name}' already exists. Use overwrite=True to update.")
+    SIGNATURES[format_name] = signature
